@@ -1,9 +1,9 @@
 # KilatMart Messaging (Track B3)
 
-Local development infrastructure for the Web Shop, Billing, and Shipping
-integration exercise. The initial setup starts RabbitMQ and PostgreSQL; the
-application services will be added to this Compose project as their owners
-implement them.
+Local development stack for the Web Shop, Billing, and Shipping integration
+exercise. It starts RabbitMQ, PostgreSQL, and three Go service skeletons from
+`backend/`. The service health endpoints are wired, while business flows are
+left for their owners to implement.
 
 ## Start
 
@@ -24,16 +24,27 @@ Check readiness:
 docker compose ps
 ```
 
-Both `rabbitmq` and `postgres` should report healthy. RabbitMQ Management UI
+All five services (`rabbitmq`, `postgres`, `web-shop`, `billing`, and
+`shipping`) should report healthy. RabbitMQ Management UI
 is at <http://localhost:15672> (defaults: `kilatmart` / `kilatmart_dev_only`).
 AMQP is exposed on `localhost:5672`; PostgreSQL is exposed on `localhost:5432`
 (default database/user/password: `kilatmart` / `kilatmart` /
 `kilatmart_dev_only`). Change host ports in `.env` if those ports are already
 in use.
 
-Services on the Compose network can connect using hostnames `rabbitmq` and
-`postgres` and the container ports `5672` and `5432` respectively. Use the
-matching `.env` credentials from the application containers.
+Services on the Compose network can reach RabbitMQ and PostgreSQL at
+`rabbitmq:5672` and `postgres:5432`. The Go skeletons do not connect to these
+backing services yet; their broker and database clients will be added with the
+business flows.
+
+## Go service skeletons
+
+`backend/` is a single Go module with three independently built executables:
+`web-shop`, `billing`, and `shipping`. Each currently exposes only
+`GET /healthz`; order APIs, RabbitMQ consumers/publisher, and database access
+are not implemented yet. The Web Shop health endpoint is available at
+<http://localhost:8080/healthz>; the other health endpoints stay inside the
+Compose network.
 
 ## RabbitMQ topology
 
@@ -71,9 +82,10 @@ including queued messages. Do not use it when you need to retain data.
 ## Project files
 
 ```text
-docker-compose.yml          RabbitMQ and PostgreSQL local stack
+docker-compose.yml          RabbitMQ, PostgreSQL, and Go services
 rabbitmq/rabbitmq.conf      Loads broker definitions on startup
 rabbitmq/definitions.json   Exchanges, queues, bindings, and DLX routing
 postgres/init/001_init.sql  Schema and sample seed data
+backend/                    Go service skeletons and shared event contract
 .env.example                Example local configuration (copy to .env)
 ```
