@@ -112,11 +112,42 @@ Compose network.
 - `billing.queue` dead-letter routing to `billing.dlx` with routing key
   `billing.dead`, bound to `billing.dlq`.
 
-Queues are durable, but publishers must also publish order events as persistent
-(delivery mode 2) for messages to survive a broker restart. The billing
-consumer must reject invalid messages with `nack(requeue=False)` to send them
-to the DLQ. The broker topology alone does not implement publisher confirms,
-consumer validation, or retry/idempotency logic; those belong to the services.
+The billing consumer must reject invalid messages with `nack(requeue=False)` to
+send them to the DLQ. The broker topology alone does not implement publisher
+confirms, consumer validation, or retry/idempotency logic; those belong to the
+services.
+
+### Message durability
+
+A queued message survives a broker restart only when all three hold:
+
+1. **The queue is durable.** Done in `definitions.json`.
+2. **The message is persistent** (delivery mode 2). This is the publisher's job.
+   In `amqp091-go` the default is transient, so set it explicitly:
+
+   ```go
+   ch.PublishWithContext(ctx, "orders.exchange", "", false, false, amqp.Publishing{
+       ContentType:  "application/json",
+       DeliveryMode: amqp.Persistent,
+       Body:         body,
+   })
+   ```
+
+   Enabling publisher confirms (`ch.Confirm(false)`) lets the Web Shop wait
+   until the broker has accepted a message before answering the HTTP request.
+3. **The broker finds its data again.** RabbitMQ stores data under its node
+   name, `rabbit@<hostname>`. Compose sets `hostname: rabbitmq`, so the node is
+   always `rabbit@rabbitmq`. Without a fixed hostname, every recreated
+   container gets a new random hostname and starts with empty queues, even
+   though the old data is still in the volume.
+
+Tested: after `docker compose restart rabbitmq`, persistent messages were still
+queued and transient ones were gone. After `docker compose down` and `up`
+(without `-v`), persistent messages were still queued.
+
+If you started the stack before `hostname: rabbitmq` was added, your volume
+holds data under an old random node name. Run `docker compose down -v` once to
+remove it.
 
 ### Broker credentials
 
@@ -163,6 +194,86 @@ docker compose up -d
 
 `down -v` permanently deletes the local PostgreSQL and RabbitMQ volumes,
 including queued messages. Do not use it when you need to retain data.
+
+## Stopping, restarting, and resetting
+
+All services use `restart: unless-stopped`. Docker restarts a container whose
+process exits on its own (a crash), but not one you stopped yourself.
+
+| Command | Effect | Data kept? |
+|---|---|---|
+| `docker compose stop <svc>` | Graceful stop. Docker does **not** restart it. | Yes |
+| `docker compose kill <svc>` | Immediate stop (exit 137). Docker does **not** restart it. | Yes |
+| Process crashes | Docker restarts the container within seconds. | Yes |
+| `docker compose start <svc>` | Starts a stopped container. | Yes |
+| `docker compose restart <svc>` | Stops and starts the same container. | Yes |
+| `docker compose down` | Removes containers and network; keeps volumes. | Yes |
+| `docker compose down -v` | Also deletes the PostgreSQL and RabbitMQ volumes. | **No** |
+
+"Data kept" assumes persistent messages (see
+[Message durability](#message-durability)).
+
+## Resiliency demo (scenario 1)
+
+This shows that orders placed while Billing is down wait in RabbitMQ and are
+charged when Billing comes back. Until the Web Shop `POST /orders` endpoint
+exists, step 2 publishes test orders through the RabbitMQ Management API.
+The commands are for a POSIX shell (Git Bash, WSL, macOS, or Linux).
+
+1. Stop Billing:
+
+   ```sh
+   docker compose stop billing
+   ```
+
+2. Publish three persistent orders to `orders.exchange`:
+
+   ```sh
+   for id in ORD-9001 ORD-9002 ORD-9003; do
+     curl -s -u kilatmart:kilatmart_dev_only -H 'content-type: application/json' \
+       http://localhost:15672/api/exchanges/%2F/orders.exchange/publish \
+       -d '{"properties":{"delivery_mode":2,"content_type":"application/json"},"routing_key":"","payload_encoding":"string","payload":"{\"order_id\":\"'"$id"'\",\"customer_id\":\"CUST-88\",\"items\":[{\"sku\":\"PRD-01\",\"qty\":2,\"price\":25000}],\"total_amount\":50000,\"shipping_address\":\"Jl. Ganesha No. 10, Bandung\"}"}'
+     echo
+   done
+   ```
+
+   Each call should print `{"routed":true}`.
+
+3. Show that the orders are waiting with no consumer: `billing.queue` should
+   have 3 messages, 3 persistent, 0 consumers.
+
+   ```sh
+   docker compose exec rabbitmq rabbitmqctl -q list_queues name messages messages_persistent consumers
+   ```
+
+4. Start Billing and show that it charges the waiting orders:
+
+   ```sh
+   docker compose start billing
+   docker compose logs billing --since 1m | grep billing.charged
+   ```
+
+5. Show the result: `billing.queue` has 0 messages and 1 consumer, and
+   `billing_charges` has the three orders.
+
+   ```sh
+   docker compose exec rabbitmq rabbitmqctl -q list_queues name messages messages_persistent consumers
+   docker compose exec postgres psql -U kilatmart -d kilatmart -c "select order_id, amount, charged_at from billing_charges order by charged_at"
+   ```
+
+`shipping.queue` also receives every order, because `orders.exchange` is a
+fanout. Its messages wait there until the Shipping consumer is implemented.
+
+Notes for collecting evidence:
+
+- The Management UI and API refresh queue statistics about every 5 seconds,
+  so their counts can lag. `rabbitmqctl list_queues` shows live values.
+- Service logs and PostgreSQL timestamps are in UTC. In WIB, add 7 hours.
+- Use a new `order_id` for each run. Billing ignores order IDs it has already
+  charged, which is the idempotency scenario, not this one.
+- To also show broker durability, run `docker compose restart rabbitmq` after
+  step 3 and before step 4. The 3 persistent messages are still queued
+  afterwards.
 
 ## Project files
 
