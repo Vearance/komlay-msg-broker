@@ -25,3 +25,20 @@ down gracefully on SIGINT/SIGTERM.
 Docker Compose builds each executable from this module using the `SERVICE`
 build argument. Add message handling, database access, and application routes
 in the corresponding command/service package as those features are developed.
+
+## Billing consumer
+
+`cmd/billing` reads `billing.queue` with manual acks (prefetch 10) and needs
+`AMQP_URL` and `DATABASE_URL` (set in `docker-compose.yml`). Each delivery is
+settled one way:
+
+| Message | Action | Log event |
+|---|---|---|
+| Valid, new `order_id` | insert into `billing_charges`, ack | `billing.charged` |
+| Valid, `order_id` already charged | ack, no new charge | `billing.duplicate_ignored` |
+| Broken JSON or bad field (empty, negative, total ≠ items sum) | `nack(requeue=false)` → `billing.dlq` | `billing.rejected` |
+| Database error | wait 1s, `nack(requeue=true)` | `billing.store_failed` |
+
+Idempotency relies on the `order_id` primary key of `billing_charges`
+(`postgres/init/002_billing.sql`). Init scripts only run on an empty volume,
+so after pulling this change run `docker compose down -v` once.

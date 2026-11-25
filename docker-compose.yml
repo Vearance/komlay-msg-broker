@@ -1,12 +1,22 @@
 name: kilatmart
 
+# Connection strings shared by the Go services (reused below via YAML anchors).
+# Hosts are Compose service names and ports are container ports, not host ports.
+# RabbitMQ credentials must match the user in rabbitmq/definitions.json.
+# %2F is the URL-encoded name of the default vhost "/".
+x-amqp-url: &amqp_url "amqp://kilatmart:kilatmart_dev_only@rabbitmq:5672/%2F"
+x-database-url: &database_url "postgres://${POSTGRES_USER:-kilatmart}:${POSTGRES_PASSWORD:-kilatmart_dev_only}@postgres:5432/${POSTGRES_DB:-kilatmart}?sslmode=disable"
+
 services:
   rabbitmq:
     image: rabbitmq:4.1-management
+    # RabbitMQ stores data under its node name (rabbit@<hostname>). A fixed
+    # hostname keeps the same data directory when the container is recreated;
+    # otherwise each new container ID starts with empty queues.
+    hostname: rabbitmq
     restart: unless-stopped
-    environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-kilatmart}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-kilatmart_dev_only}
+    # Users, vhosts, and permissions come from rabbitmq/definitions.json.
+    # RABBITMQ_DEFAULT_USER/PASS are ignored when definitions are loaded at boot.
     ports:
       - "127.0.0.1:${RABBITMQ_AMQP_PORT:-5672}:5672"
       - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
@@ -15,8 +25,10 @@ services:
       - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
       - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
+      # "ping" only proves the Erlang node is up; listeners open later, after
+      # definitions are imported. Wait until AMQP (5672) accepts connections.
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
       timeout: 5s
       retries: 10
       start_period: 20s
@@ -31,7 +43,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-kilatmart}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kilatmart_dev_only}
     ports:
-      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
@@ -52,6 +64,8 @@ services:
     restart: unless-stopped
     environment:
       PORT: "8080"
+      AMQP_URL: *amqp_url
+      DATABASE_URL: *database_url
     ports:
       - "127.0.0.1:${WEB_SHOP_PORT:-8080}:8080"
     depends_on:
@@ -76,6 +90,8 @@ services:
     restart: unless-stopped
     environment:
       PORT: "8080"
+      AMQP_URL: *amqp_url
+      DATABASE_URL: *database_url
     depends_on:
       postgres:
         condition: service_healthy
@@ -98,6 +114,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: "8080"
+      AMQP_URL: *amqp_url
     depends_on:
       rabbitmq:
         condition: service_healthy
