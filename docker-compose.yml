@@ -10,6 +10,10 @@ x-database-url: &database_url "postgres://${POSTGRES_USER:-kilatmart}:${POSTGRES
 services:
   rabbitmq:
     image: rabbitmq:4.1-management
+    # RabbitMQ stores data under its node name (rabbit@<hostname>). A fixed
+    # hostname keeps the same data directory when the container is recreated;
+    # otherwise each new container ID starts with empty queues.
+    hostname: rabbitmq
     restart: unless-stopped
     # Users, vhosts, and permissions come from rabbitmq/definitions.json.
     # RABBITMQ_DEFAULT_USER/PASS are ignored when definitions are loaded at boot.
