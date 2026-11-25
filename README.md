@@ -39,6 +39,15 @@ DBeaver). Containers talk to each other over the Compose network using the
 service name and the container port, e.g. `postgres:5432`, regardless of the
 host port.
 
+The Go services start only after RabbitMQ and PostgreSQL are healthy
+(`depends_on: condition: service_healthy`). RabbitMQ counts as healthy only
+when `rabbitmq-diagnostics check_port_connectivity` can connect to its
+listeners, including AMQP on 5672. A plain `ping` would pass several seconds
+earlier, before the broker has finished importing definitions and accepts
+connections. Note that the Go services' own `/healthz` only shows that the
+HTTP server is up; it does not report whether a consumer is connected to the
+broker, so check the service logs for that.
+
 ## Connecting services
 
 Compose passes connection strings to the Go services as environment variables.
