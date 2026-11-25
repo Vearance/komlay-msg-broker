@@ -76,6 +76,8 @@ services:
     restart: unless-stopped
     environment:
       PORT: "8080"
+      AMQP_URL: amqp://${RABBITMQ_DEFAULT_USER:-kilatmart}:${RABBITMQ_DEFAULT_PASS:-kilatmart_dev_only}@rabbitmq:5672/
+      DATABASE_URL: postgres://${POSTGRES_USER:-kilatmart}:${POSTGRES_PASSWORD:-kilatmart_dev_only}@postgres:5432/${POSTGRES_DB:-kilatmart}?sslmode=disable
     depends_on:
       postgres:
         condition: service_healthy
