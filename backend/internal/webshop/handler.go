@@ -1,6 +1,7 @@
 package webshop
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,28 +69,36 @@ func (h *Handler) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// 1. Save order into database if store is configured
-	if h.store != nil {
-		if err := h.store.CreateOrder(ctx, req); err != nil {
-			h.logger.Error("webshop.create_order_store_failed", "order_id", req.OrderID, "error", err)
-			respondError(w, http.StatusInternalServerError, "failed to persist order: "+err.Error())
-			return
-		}
-	}
-
-	// 2. Publish order_placed event to RabbitMQ
 	payload, err := json.Marshal(req)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, "marshal event payload: "+err.Error())
 		return
 	}
 
-	if h.publisher != nil {
-		if err := h.publisher.PublishOrderPlaced(ctx, payload); err != nil {
-			h.logger.Error("webshop.publish_failed", "order_id", req.OrderID, "error", err)
-			respondError(w, http.StatusInternalServerError, "failed to publish order event: "+err.Error())
-			return
+	var publishErr error
+	publish := func(ctx context.Context) error {
+		if h.publisher == nil {
+			return nil
 		}
+		publishErr = h.publisher.PublishOrderPlaced(ctx, payload)
+		return publishErr
+	}
+
+	if h.store != nil {
+		err = h.store.CreateOrder(ctx, req, publish)
+	} else {
+		err = publish(ctx)
+	}
+
+	if publishErr != nil {
+		h.logger.Error("webshop.publish_failed", "order_id", req.OrderID, "error", publishErr)
+		respondError(w, http.StatusServiceUnavailable, "order not placed: message broker unavailable, retry later: "+publishErr.Error())
+		return
+	}
+	if err != nil {
+		h.logger.Error("webshop.create_order_store_failed", "order_id", req.OrderID, "error", err)
+		respondError(w, http.StatusInternalServerError, "failed to persist order: "+err.Error())
+		return
 	}
 
 	h.logger.Info("webshop.order_placed", "order_id", req.OrderID, "customer_id", req.CustomerID, "total_amount", req.TotalAmount)
@@ -156,7 +165,6 @@ func (h *Handler) handleInjectRaw(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /test/inject-duplicate
-// Publishes the same OrderPlaced event twice to orders.exchange to test Idempotent Consumer
 func (h *Handler) handleInjectDuplicate(w http.ResponseWriter, r *http.Request) {
 	var req contracts.OrderPlaced
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -201,7 +209,6 @@ func (h *Handler) handleInjectDuplicate(w http.ResponseWriter, r *http.Request) 
 }
 
 // POST /test/inject-corrupt
-// Publishes malformed JSON or schema-invalid order to test Dead-Letter Queue (DLQ)
 func (h *Handler) handleInjectCorrupt(w http.ResponseWriter, r *http.Request) {
 	scenario := r.URL.Query().Get("type")
 	var corruptPayload []byte

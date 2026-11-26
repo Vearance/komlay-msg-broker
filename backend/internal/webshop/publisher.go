@@ -9,12 +9,13 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// Publisher defines the contract for publishing messages to RabbitMQ.
 type Publisher interface {
 	PublishOrderPlaced(ctx context.Context, body []byte) error
 	PublishRaw(ctx context.Context, exchange, routingKey string, body []byte, contentType string) error
 	Close() error
 }
+
+const confirmTimeout = 5 * time.Second
 
 type RabbitMQPublisher struct {
 	url      string
@@ -23,6 +24,10 @@ type RabbitMQPublisher struct {
 	mu   sync.Mutex
 	conn *amqp.Connection
 	ch   *amqp.Channel
+
+	// publishMu serializes publish + confirm wait, so one confirm always
+	// belongs to the publish that is waiting for it.
+	publishMu sync.Mutex
 }
 
 func NewRabbitMQPublisher(url, exchange string) (*RabbitMQPublisher, error) {
@@ -48,6 +53,11 @@ func (p *RabbitMQPublisher) connect() error {
 		return fmt.Errorf("open AMQP channel: %w", err)
 	}
 
+	if err := ch.Confirm(false); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("enable publisher confirms: %w", err)
+	}
+
 	p.conn = conn
 	p.ch = ch
 	return nil
@@ -71,13 +81,14 @@ func (p *RabbitMQPublisher) getChannel() (*amqp.Channel, error) {
 	return p.ch, nil
 }
 
-// PublishOrderPlaced publishes to the configured exchange with DeliveryMode = Persistent.
 func (p *RabbitMQPublisher) PublishOrderPlaced(ctx context.Context, body []byte) error {
 	return p.PublishRaw(ctx, p.exchange, "", body, "application/json")
 }
 
-// PublishRaw allows publishing arbitrary payload/content-type, useful for test injection.
 func (p *RabbitMQPublisher) PublishRaw(ctx context.Context, exchange, routingKey string, body []byte, contentType string) error {
+	p.publishMu.Lock()
+	defer p.publishMu.Unlock()
+
 	ch, err := p.getChannel()
 	if err != nil {
 		return fmt.Errorf("get channel: %w", err)
@@ -94,7 +105,7 @@ func (p *RabbitMQPublisher) PublishRaw(ctx context.Context, exchange, routingKey
 		Timestamp:    time.Now().UTC(),
 	}
 
-	err = ch.PublishWithContext(
+	confirm, err := ch.PublishWithDeferredConfirmWithContext(
 		ctx,
 		exchange,
 		routingKey,
@@ -103,16 +114,30 @@ func (p *RabbitMQPublisher) PublishRaw(ctx context.Context, exchange, routingKey
 		msg,
 	)
 	if err != nil {
-		// Invalidate channel on publish error to trigger reconnect next time
-		p.mu.Lock()
-		if p.ch != nil {
-			_ = p.ch.Close()
-			p.ch = nil
-		}
-		p.mu.Unlock()
+		p.invalidateChannel()
 		return fmt.Errorf("publish message: %w", err)
 	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, confirmTimeout)
+	defer cancel()
+	acked, err := confirm.WaitContext(waitCtx)
+	if err != nil {
+		p.invalidateChannel()
+		return fmt.Errorf("wait for publisher confirm: %w", err)
+	}
+	if !acked {
+		return fmt.Errorf("broker nacked the message")
+	}
 	return nil
+}
+
+func (p *RabbitMQPublisher) invalidateChannel() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ch != nil {
+		_ = p.ch.Close()
+		p.ch = nil
+	}
 }
 
 func (p *RabbitMQPublisher) Close() error {
