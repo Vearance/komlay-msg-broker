@@ -20,7 +20,7 @@ type OrderWithItems struct {
 }
 
 type Store interface {
-	CreateOrder(ctx context.Context, order contracts.OrderPlaced) error
+	CreateOrder(ctx context.Context, order contracts.OrderPlaced, beforeCommit func(context.Context) error) error
 	GetOrders(ctx context.Context) ([]OrderWithItems, error)
 	GetOrderByID(ctx context.Context, id string) (*OrderWithItems, error)
 }
@@ -33,7 +33,7 @@ func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore {
 	return &PostgresStore{pool: pool}
 }
 
-func (s *PostgresStore) CreateOrder(ctx context.Context, order contracts.OrderPlaced) error {
+func (s *PostgresStore) CreateOrder(ctx context.Context, order contracts.OrderPlaced, beforeCommit func(context.Context) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -60,6 +60,12 @@ func (s *PostgresStore) CreateOrder(ctx context.Context, order contracts.OrderPl
 		}
 	}
 
+	if beforeCommit != nil {
+		if err := beforeCommit(ctx); err != nil {
+			return err // the deferred Rollback undoes the inserts
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
@@ -78,7 +84,7 @@ func (s *PostgresStore) GetOrders(ctx context.Context) ([]OrderWithItems, error)
 	defer rows.Close()
 
 	var orders []OrderWithItems
-	orderMap := make(map[string]*OrderWithItems)
+	orderIndex := make(map[string]int)
 
 	for rows.Next() {
 		var o OrderWithItems
@@ -87,7 +93,10 @@ func (s *PostgresStore) GetOrders(ctx context.Context) ([]OrderWithItems, error)
 		}
 		o.Items = make([]contracts.OrderItem, 0)
 		orders = append(orders, o)
-		orderMap[o.OrderID] = &orders[len(orders)-1]
+		orderIndex[o.OrderID] = len(orders) - 1
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read orders: %w", err)
 	}
 
 	if len(orders) == 0 {
@@ -110,9 +119,12 @@ func (s *PostgresStore) GetOrders(ctx context.Context) ([]OrderWithItems, error)
 		if err := itemRows.Scan(&orderID, &item.SKU, &item.Qty, &item.Price); err != nil {
 			return nil, fmt.Errorf("scan order item: %w", err)
 		}
-		if ord, ok := orderMap[orderID]; ok {
-			ord.Items = append(ord.Items, item)
+		if i, ok := orderIndex[orderID]; ok {
+			orders[i].Items = append(orders[i].Items, item)
 		}
+	}
+	if err := itemRows.Err(); err != nil {
+		return nil, fmt.Errorf("read order items: %w", err)
 	}
 
 	return orders, nil
